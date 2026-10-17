@@ -1,0 +1,30 @@
+# ROS 2 colcon build artifacts
+build/
+install/
+log/
+**/build/
+**/install/
+**/log/
+
+# Python caches and byte-compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+
+# ROS logs & bags
+*.bag
+*.db3
+.ros/
+
+# Editor / IDE configuration
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS artifacts
+.DS_Store
+Thumbs.db
