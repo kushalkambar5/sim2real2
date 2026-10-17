@@ -3,24 +3,20 @@
 tier3_node.py
 Tier 3 — Cluttered-Arena Autonomous Navigation for Sim2Real Simulation Round.
 
-All perception, mapping, planning, tracking, control, and state machine logic
-are completely self-contained within this file.
-
 Inputs : /joint_states, /imu, /overhead_camera/image_raw, /overhead_camera/camera_info
 Outputs: /cmd_vel, /odom, TF odom -> base_link
 
 Mission:
     1. Visually detect 5 initial green target disks and 4 magenta-topped obstacle walls.
     2. Build a 2D occupancy grid with dual inflation:
-       - Interior obstacle walls: ~0.28 m inflation (robot half-diagonal + clearance).
+       - Interior obstacle walls: 0.28 m inflation (robot circumradius 0.22m + clearance).
        - Outer perimeter: 0.10 m inflation (preserves reachability of home at (0,0)).
     3. Plan collision-free paths using 8-connected A* with Line-of-Sight (LOS) smoothing.
     4. Compute optimal TSP visiting order using actual A* pairwise path costs.
-    5. Track paths using a lookahead follower with obstacle crawl and heading slowdown.
-    6. Fulfill continuous dwell >= 2.30 s (|v| <= 0.03 m/s) at all waypoints.
+    5. Track paths using a forward-only PathTracker with line-of-sight corner cutting.
+    6. Fulfill continuous dwell >= 2.30 s (|v| <= 0.03 m/s) at all 7 targets.
     7. Detect 2 dynamic green waypoints spawning visually at T+7.0 s and incorporate them.
-    8. Snap odometry to visually confirmed targets upon dwell completion to eliminate drift.
-    9. Return home to (0,0) and dwell >= 2.30 s with zero wall/obstacle collisions.
+    8. Return home to (0,0) and dwell >= 2.30 s with zero collisions.
 
 Integrity:
     - Never subscribes to /waypoints, /dynamic_waypoints, /evaluator/*, or /gz/*.
@@ -69,9 +65,10 @@ HOME_Y = 0.0
 
 WAYPOINT_PHYSICAL_RADIUS = 0.15  # m green disk radius
 
-# Evaluator collision perimeter bounds
-ARENA_COLLISION_MIN = -0.125
-ARENA_COLLISION_MAX = 2.875
+# Evaluator collision perimeter bounds (-0.125 .. 2.875)
+PERIMETER_MIN_X, PERIMETER_MAX_X = -0.125, 2.875
+PERIMETER_MIN_Y, PERIMETER_MAX_Y = -0.125, 2.875
+PERIMETER_SAFETY_DIST = 0.10     # m; same as Tier 1 & 2
 
 # Plausible arena coordinate bounds for detections
 ARENA_MIN = -0.15
@@ -81,28 +78,23 @@ ARENA_MAX = 2.95
 CAM_X_DEFAULT = 1.50
 CAM_Y_DEFAULT = 1.50
 CAM_Z_DEFAULT = 4.00
-CAMERA_WIDTH = 800
-CAMERA_HEIGHT = 800
-CAMERA_FOV_DEG = 70.0
 
 # ---------------------------------------------------------------------------
 # Tuning Parameters
 # ---------------------------------------------------------------------------
-GRID_RESOLUTION = 0.03      # m/cell (~104 x 104 cells)
+GRID_RESOLUTION = 0.03      # m/cell
 SAFETY_MARGIN = 0.28        # m interior obstacle clearance
-PERIMETER_MARGIN = 0.10     # m perimeter margin (keeps home (0,0) reachable)
+PERIMETER_MARGIN = 0.10     # m perimeter margin
 
-TARGET_STOP_RADIUS = 0.13   # m controller transition radius into dwell (< 0.20 m)
+TARGET_STOP_RADIUS = 0.12   # m controller transition radius into dwell (< 0.20 m)
 DWELL_TIME = 2.30           # s continuous dwell requirement (evaluator requires 2.00 s)
 
-LOOKAHEAD_DISTANCE = 0.15   # m path lookahead distance
-
-K_HEADING = 2.0             # in-place rotation gain
-K_HEADING_DRIVE = 1.5       # driving angular gain
+K_ANGLE = 2.0               # in-place rotation gain
+K_ANGLE_DRIVE = 1.5         # driving angular gain
 K_DISTANCE = 0.8            # distance to speed gain
 
-ALIGN_THRESHOLD = math.radians(8.0)
-REALIGN_THRESHOLD = math.radians(15.0)
+ALIGN_THRESHOLD = math.radians(10.0)
+REALIGN_THRESHOLD = math.radians(20.0)
 
 WAYPOINT_DEDUP_DISTANCE = 0.25  # m spatial merge threshold
 
@@ -219,11 +211,6 @@ class OdometryEstimator:
         self.theta = normalize_angle(self.theta + self.omega * dt)
         self.last_time_s = now_s
 
-    def snap_to(self, x: float, y: float) -> None:
-        """Correct dead-reckoning drift when stopped at a visually confirmed target."""
-        self.x = float(x)
-        self.y = float(y)
-
 
 # ---------------------------------------------------------------------------
 # Camera Projection & Coordinate Mapper
@@ -292,10 +279,6 @@ class CameraMapper:
         u = xc * fx / self.cam_z + cx
         v = yc * fy / self.cam_z + cy
         return u, v
-
-    def meters_per_pixel(self) -> float:
-        fx = self.fx if self.fx else focal_from_fov(800.0)
-        return self.cam_z / max(fx, 1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -440,11 +423,10 @@ def obstacles_to_world(detections: list, pixel_to_world_fn) -> List[Dict[str, fl
 class WaypointTracker:
     """Identity-preserving target tracker with temporal-stability gating."""
 
-    def __init__(self, merge_threshold=WAYPOINT_DEDUP_DISTANCE, min_obs=3, alpha=0.30, tentative_prune_s=8.0):
+    def __init__(self, merge_threshold=WAYPOINT_DEDUP_DISTANCE, min_obs=3, alpha=0.30):
         self.merge_threshold = float(merge_threshold)
         self.min_obs = int(min_obs)
         self.alpha = float(alpha)
-        self.tentative_prune_s = float(tentative_prune_s)
         self._items = {}
         self._next_id = 0
 
@@ -467,7 +449,6 @@ class WaypointTracker:
                 wp["y"] = (1.0 - self.alpha) * wp["y"] + self.alpha * wy
                 wp["obs_count"] += 1
                 wp["last_seen"] = now_s
-                wp["confidence"] = min(1.0, wp["obs_count"] / max(self.min_obs * 2, 1))
                 if not was_confirmed and wp["obs_count"] >= self.min_obs:
                     new_ids.append(best_id)
             else:
@@ -475,15 +456,9 @@ class WaypointTracker:
                 self._next_id += 1
                 self._items[wid] = {"x": float(wx), "y": float(wy),
                                     "visited": False, "obs_count": 1,
-                                    "last_seen": now_s, "confidence": 0.2,
-                                    "id": wid}
+                                    "last_seen": now_s, "id": wid}
                 if self.min_obs <= 1:
                     new_ids.append(wid)
-        stale = [wid for wid, wp in self._items.items()
-                 if wp["obs_count"] < self.min_obs
-                 and (now_s - wp["last_seen"]) > self.tentative_prune_s]
-        for wid in stale:
-            del self._items[wid]
         return self.confirmed_count(), new_ids
 
     def confirmed_count(self) -> int:
@@ -595,7 +570,7 @@ class OccupancyGrid:
 
     def __init__(self, resolution=GRID_RESOLUTION, min_x=-0.15, max_x=2.95, min_y=-0.15, max_y=2.95,
                  safety_margin=SAFETY_MARGIN, perimeter_margin=PERIMETER_MARGIN,
-                 arena_min=ARENA_COLLISION_MIN, arena_max=ARENA_COLLISION_MAX):
+                 arena_min=PERIMETER_MIN_X, arena_max=PERIMETER_MAX_X):
         self.resolution = float(resolution)
         self.min_x = float(min_x)
         self.max_x = float(max_x)
@@ -875,283 +850,78 @@ def order_waypoints_a_star(grid: OccupancyGrid, start_xy: tuple, unvisited: list
 
 
 # ---------------------------------------------------------------------------
-# Path Follower (Controller)
+# Path Follower (Sub-waypoint Tracking with Line-Of-Sight Corner-Cutting)
 # ---------------------------------------------------------------------------
-class PathFollower:
-    """Lookahead path follower with obstacle-aware and arrival speed scaling."""
+class PathTracker:
+    """
+    Forward-only path follower that cleanly tracks sub-waypoints and advances
+    towards the final target without backwards lookups.
+    """
 
-    def __init__(self, lookahead=LOOKAHEAD_DISTANCE, k_heading=K_HEADING, k_drive=K_HEADING_DRIVE,
-                 k_distance=K_DISTANCE, speed_open=0.22, speed_near_obstacle=0.12, speed_near_target=0.06):
-        self.lookahead = float(lookahead)
-        self.k_heading = float(k_heading)
+    def __init__(self, k_angle=K_ANGLE, k_drive=K_ANGLE_DRIVE, k_dist=K_DISTANCE):
+        self.k_angle = float(k_angle)
         self.k_drive = float(k_drive)
-        self.k_distance = float(k_distance)
-        self.speed_open = float(speed_open)
-        self.speed_near_obstacle = float(speed_near_obstacle)
-        self.speed_near_target = float(speed_near_target)
+        self.k_dist = float(k_dist)
         self.path = []
-        self._seg_index = 0
+        self.target_idx = 1
 
     def set_path(self, path: list) -> None:
         self.path = list(path) if path else []
-        self._seg_index = 0
+        self.target_idx = 1 if len(self.path) > 1 else 0
 
     def clear(self) -> None:
         self.path = []
-        self._seg_index = 0
+        self.target_idx = 1
 
-    def _nearest_index(self, x: float, y: float) -> int:
-        best_i = 0
-        best_d = float("inf")
-        start = max(0, self._seg_index - 2)
-        for i in range(start, len(self.path)):
-            d = math.hypot(x - self.path[i][0], y - self.path[i][1])
-            if d < best_d:
-                best_d = d
-                best_i = i
-        self._seg_index = min(best_i, len(self.path) - 2) if self.path else 0
-        return best_i
+    def compute(self, x: float, y: float, theta: float, grid: OccupancyGrid = None) -> Tuple[float, float, bool]:
+        """
+        Returns (v, omega, reached_final_target).
+        """
+        if not self.path or len(self.path) < 2:
+            return 0.0, 0.0, True
 
-    def lookahead_point(self, x: float, y: float) -> Optional[Tuple[float, float]]:
-        if not self.path:
-            return None
-        ni = self._nearest_index(x, y)
-        for i in range(ni, len(self.path)):
-            d = math.hypot(x - self.path[i][0], y - self.path[i][1])
-            if d >= self.lookahead:
-                return self.path[i]
-        return self.path[-1]
+        # Check line-of-sight shortcut to further waypoints along path
+        if grid is not None:
+            for j in range(len(self.path) - 1, self.target_idx, -1):
+                if grid.segment_free(x, y, self.path[j][0], self.path[j][1]):
+                    self.target_idx = j
+                    break
 
-    def compute(self, x: float, y: float, theta: float, grid: OccupancyGrid = None) -> Tuple[float, float]:
-        if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(theta)):
-            return 0.0, 0.0
-        if not self.path:
-            return 0.0, 0.0
-        goal = self.lookahead_point(x, y)
-        if goal is None:
-            return 0.0, 0.0
+        # Advance intermediate waypoint when reached
+        if self.target_idx < len(self.path) - 1:
+            d_intermediate = math.hypot(x - self.path[self.target_idx][0], y - self.path[self.target_idx][1])
+            if d_intermediate < 0.15:
+                self.target_idx += 1
 
-        dx = goal[0] - x
-        dy = goal[1] - y
-        dist_end = math.hypot(self.path[-1][0] - x, self.path[-1][1] - y)
+        tx, ty = self.path[self.target_idx]
+        is_final = (self.target_idx == len(self.path) - 1)
 
-        desired = math.atan2(dy, dx)
-        he = normalize_angle(desired - theta)
+        dx = tx - x
+        dy = ty - y
+        dist = math.hypot(dx, dy)
+        desired_yaw = math.atan2(dy, dx)
+        he = normalize_angle(desired_yaw - theta)
 
-        # Proportional base forward speed
-        v_des = min(self.speed_open, self.k_distance * max(dist_end, 0.0))
-        if dist_end <= 0.50:
-            v_des = min(v_des, 0.15)
-        if dist_end <= 0.25:
-            v_des = min(v_des, self.speed_near_target + 0.02)
-        if dist_end <= 0.12:
-            v_des = 0.0
+        # Stop when close to final waypoint
+        if is_final and dist <= TARGET_STOP_RADIUS:
+            return 0.0, 0.0, True
 
-        # Slow down on large heading errors; rotate in place if > 30 deg
-        ah = abs(he)
-        if ah > math.radians(30.0):
-            v_des = 0.0
-        elif ah > math.radians(15.0):
-            v_des *= 0.5
+        # Heading alignment
+        if abs(he) > REALIGN_THRESHOLD:
+            v = 0.0
+            w = clamp(self.k_angle * he, -MAX_ANGULAR_SPEED, MAX_ANGULAR_SPEED)
+        else:
+            v_des = min(MAX_LINEAR_SPEED, self.k_dist * dist)
+            v_des *= max(0.0, math.cos(he))
+            if is_final:
+                if dist <= 0.40:
+                    v_des = min(v_des, 0.15)
+                if dist <= 0.20:
+                    v_des = min(v_des, 0.08)
+            w = clamp(self.k_drive * he, -MAX_ANGULAR_SPEED, MAX_ANGULAR_SPEED)
+            v = clamp(v_des, MIN_LINEAR_SPEED, MAX_LINEAR_SPEED)
 
-        omega = clamp(self.k_drive * he, -MAX_ANGULAR_SPEED, MAX_ANGULAR_SPEED)
-
-        # Proactive obstacle crawl: probe ahead
-        if grid is not None and dist_end > 0.12 and v_des > 0:
-            px = x + math.cos(desired) * 0.20
-            py = y + math.sin(desired) * 0.20
-            if not grid.is_free_world(px, py):
-                v_des = min(v_des, self.speed_near_obstacle)
-
-        v = clamp(v_des, MIN_LINEAR_SPEED, MAX_LINEAR_SPEED)
-        return v, omega
-
-
-# ---------------------------------------------------------------------------
-# Mission Manager (State Machine)
-# ---------------------------------------------------------------------------
-class MissionManager:
-    INIT = "INIT"
-    LOCALIZE = "LOCALIZE"
-    PERCEIVE = "PERCEIVE"
-    PLAN = "PLAN"
-    NAVIGATE = "NAVIGATE"
-    DWELL = "DWELL"
-    REPLAN = "REPLAN"
-    RETURN_HOME = "RETURN_HOME"
-    HOME_DWELL = "HOME_DWELL"
-    COMPLETE = "COMPLETE"
-    FAILSAFE = "FAILSAFE"
-
-    def __init__(self, dwell_time=DWELL_TIME, target_stop_radius=TARGET_STOP_RADIUS,
-                 waypoint_tolerance=WAYPOINT_TOLERANCE, stop_speed=STOP_SPEED, home_tolerance=HOME_TOLERANCE):
-        self.dwell_time = float(dwell_time)
-        self.target_stop_radius = float(target_stop_radius)
-        self.waypoint_tolerance = float(waypoint_tolerance)
-        self.stop_speed = float(stop_speed)
-        self.home_tolerance = float(home_tolerance)
-
-        self.state = self.INIT
-        self.current_target = None
-        self.current_path = []
-        self.ordered_route = []
-        self._dwell_start = None
-        self._home_dwell_start = None
-        self._planned_count = 0
-        self.plan_request = False
-        self.fail_reason = ""
-
-    def is_stopped(self, v: float, omega: float) -> bool:
-        return abs(v) <= self.stop_speed and abs(omega) <= 0.15
-
-    def notify_planned(self, confirmed_count: int) -> None:
-        self._planned_count = confirmed_count
-        self.plan_request = False
-
-    def request_replan(self) -> None:
-        self.plan_request = True
-
-    def fail(self, reason: str) -> None:
-        self.fail_reason = reason
-        self.state = self.FAILSAFE
-
-    def recover(self) -> None:
-        self.fail_reason = ""
-        self.state = self.PLAN
-
-    def step(self, pose: tuple, vel: tuple, tracker: WaypointTracker, now_s: float) -> str:
-        x, y, _theta = pose
-        v, omega = vel
-
-        if self.state == self.INIT:
-            self._dwell_start = None
-            self._home_dwell_start = None
-            self.state = self.LOCALIZE
-            return self.state
-
-        if self.state == self.LOCALIZE:
-            self.state = self.PERCEIVE
-            return self.state
-
-        if self.state == self.PERCEIVE:
-            if tracker.confirmed_count() >= 1:
-                self.state = self.PLAN
-            return self.state
-
-        if self.state == self.PLAN:
-            if not tracker.has_unvisited():
-                d_home = math.hypot(x - HOME_X, y - HOME_Y)
-                if d_home <= self.home_tolerance and self.is_stopped(v, omega):
-                    if self._home_dwell_start is None:
-                        self._home_dwell_start = now_s
-                    self.state = self.HOME_DWELL
-                else:
-                    self.state = self.RETURN_HOME
-                return self.state
-            if self.current_target is None:
-                return self.state
-            self._dwell_start = None
-            self.state = self.NAVIGATE
-            return self.state
-
-        if self.state == self.NAVIGATE:
-            wp = tracker.get(self.current_target) if self.current_target is not None else None
-            if wp is None or wp.get("visited", False):
-                self._dwell_start = None
-                self.current_path = []
-                self.state = self.PLAN
-                return self.state
-            d = math.hypot(x - wp["x"], y - wp["y"])
-            if d <= self.target_stop_radius:
-                self.state = self.DWELL
-                if self._dwell_start is None and self.is_stopped(v, omega):
-                    self._dwell_start = now_s
-                return self.state
-            if self.plan_request and not self.current_path:
-                self.state = self.REPLAN
-                return self.state
-            return self.state
-
-        if self.state == self.DWELL:
-            wp = tracker.get(self.current_target) if self.current_target is not None else None
-            if wp is None or wp.get("visited", False):
-                self._dwell_start = None
-                self.state = self.PLAN
-                return self.state
-            d = math.hypot(x - wp["x"], y - wp["y"])
-            if d > self.waypoint_tolerance or not self.is_stopped(v, omega):
-                self._dwell_start = None
-                self.state = self.NAVIGATE
-                return self.state
-            if self._dwell_start is None:
-                if self.is_stopped(v, omega) and d <= self.waypoint_tolerance:
-                    self._dwell_start = now_s
-                return self.state
-            if (now_s - self._dwell_start) >= self.dwell_time:
-                prev_target = self.current_target
-                tracker.mark_visited(self.current_target)
-                if prev_target is not None:
-                    prev_wp = tracker.get(prev_target)
-                    if prev_wp is not None:
-                        for wid, wpp in tracker.confirmed_items():
-                            if not wpp.get("visited", False):
-                                if math.hypot(wpp["x"] - prev_wp["x"], wpp["y"] - prev_wp["y"]) <= 0.30:
-                                    tracker.mark_visited(wid)
-                self._dwell_start = None
-                self.current_target = None
-                self.current_path = []
-                self.plan_request = False
-                if tracker.has_unvisited():
-                    self.state = self.REPLAN if tracker.confirmed_count() > self._planned_count else self.PLAN
-                else:
-                    self.state = self.RETURN_HOME
-                return self.state
-            return self.state
-
-        if self.state == self.REPLAN:
-            if not tracker.has_unvisited():
-                self.state = self.RETURN_HOME
-                return self.state
-            if self.current_target is not None and self.current_path:
-                self._dwell_start = None
-                self.plan_request = False
-                self.state = self.NAVIGATE
-            return self.state
-
-        if self.state == self.RETURN_HOME:
-            d_home = math.hypot(x - HOME_X, y - HOME_Y)
-            if d_home <= self.home_tolerance:
-                if self.is_stopped(v, omega):
-                    if self._home_dwell_start is None:
-                        self._home_dwell_start = now_s
-                    self.state = self.HOME_DWELL
-                return self.state
-            if tracker.has_unvisited() and tracker.confirmed_count() > self._planned_count:
-                self._home_dwell_start = None
-                self.state = self.REPLAN
-            return self.state
-
-        if self.state == self.HOME_DWELL:
-            d_home = math.hypot(x - HOME_X, y - HOME_Y)
-            if d_home > self.home_tolerance or not self.is_stopped(v, omega):
-                self._home_dwell_start = None
-                self.state = self.RETURN_HOME
-                return self.state
-            if self._home_dwell_start is None:
-                self._home_dwell_start = now_s
-                return self.state
-            if (now_s - self._home_dwell_start) >= self.dwell_time:
-                self.state = self.COMPLETE
-            return self.state
-
-        if self.state == self.COMPLETE:
-            return self.state
-
-        if self.state == self.FAILSAFE:
-            return self.state
-
-        self.state = self.FAILSAFE
-        return self.state
+        return v, w, False
 
 
 # ---------------------------------------------------------------------------
@@ -1159,6 +929,16 @@ class MissionManager:
 # ---------------------------------------------------------------------------
 class SolutionNode(Node):
     """Tier 3 visual navigation and obstacle avoidance node."""
+
+    # Mission states
+    WAIT_FOR_SENSORS = "WAIT_FOR_SENSORS"
+    PERCEIVE = "PERCEIVE"
+    PLAN_ROUTE = "PLAN_ROUTE"
+    NAVIGATE = "NAVIGATE"
+    DWELL = "DWELL"
+    HOME = "HOME"
+    HOME_DWELL = "HOME_DWELL"
+    COMPLETE = "COMPLETE"
 
     def __init__(self):
         super().__init__("solution_node")
@@ -1177,7 +957,6 @@ class SolutionNode(Node):
         self.declare_parameter("grid_resolution", GRID_RESOLUTION)
         self.declare_parameter("safety_margin", SAFETY_MARGIN)
         self.declare_parameter("perimeter_margin", PERIMETER_MARGIN)
-        self.declare_parameter("lookahead_distance", LOOKAHEAD_DISTANCE)
         self.declare_parameter("dwell_time", DWELL_TIME)
         self.declare_parameter("target_stop_radius", TARGET_STOP_RADIUS)
         self.declare_parameter("waypoint_dedup_distance", WAYPOINT_DEDUP_DISTANCE)
@@ -1196,9 +975,8 @@ class SolutionNode(Node):
         grid_res = float(self.get_parameter("grid_resolution").value)
         safety = float(self.get_parameter("safety_margin").value)
         peri_margin = float(self.get_parameter("perimeter_margin").value)
-        lookahead = float(self.get_parameter("lookahead_distance").value)
-        dwell_time = float(self.get_parameter("dwell_time").value)
-        stop_radius = float(self.get_parameter("target_stop_radius").value)
+        self.dwell_time = float(self.get_parameter("dwell_time").value)
+        self.stop_radius = float(self.get_parameter("target_stop_radius").value)
         dedup = float(self.get_parameter("waypoint_dedup_distance").value)
         self.debug_viz = bool(self.get_parameter("debug_visualization").value)
 
@@ -1212,8 +990,7 @@ class SolutionNode(Node):
         self.obs_tracker = ObstacleTracker()
         self.grid = OccupancyGrid(resolution=grid_res, safety_margin=safety, perimeter_margin=peri_margin)
         self.grid.rebuild([])
-        self.follower = PathFollower(lookahead=lookahead)
-        self.mission = MissionManager(dwell_time=dwell_time, target_stop_radius=stop_radius)
+        self.path_tracker = PathTracker()
         self.bridge = CvBridge() if CvBridge is not None else None
 
         # State Variables
@@ -1221,15 +998,16 @@ class SolutionNode(Node):
         self._has_image = False
         self._perceive_time0 = None
         self._map_built_with_obstacles = False
-        self._plan_fail_count = 0
         self._tick = 0
 
-        # Stuck detection
-        self._stuck_pos_start = None
-        self._stuck_threshold_v = 0.10
-        self._stuck_min_progress = 0.05
-        self._stuck_time = 5.0
-        self._peri_bounds = (ARENA_COLLISION_MIN, ARENA_COLLISION_MAX, ARENA_COLLISION_MIN, ARENA_COLLISION_MAX)
+        # Mission state
+        self._state = self.WAIT_FOR_SENSORS
+        self._route = []
+        self._current_target = None
+        self._current_path = []
+        self._dwell_start = None
+        self._home_dwell_start = None
+        self._planned_count = 0
 
         # Publishers
         self.cmd_pub = self.create_publisher(Twist, "/cmd_vel", 10)
@@ -1324,6 +1102,34 @@ class SolutionNode(Node):
     def _publish_stop(self) -> None:
         self.cmd_pub.publish(self._make_safe_cmd(0.0, 0.0))
 
+    def _perimeter_safe_cmd(self, v: float, omega: float) -> Tuple[float, float]:
+        """Override command if estimated pose is dangerously close to a perimeter wall."""
+        dist_west = self.estimator.x - PERIMETER_MIN_X
+        dist_east = PERIMETER_MAX_X - self.estimator.x
+        dist_south = self.estimator.y - PERIMETER_MIN_Y
+        dist_north = PERIMETER_MAX_Y - self.estimator.y
+        min_dist = min(dist_west, dist_east, dist_south, dist_north)
+
+        if min_dist >= PERIMETER_SAFETY_DIST:
+            return v, omega
+
+        v = 0.0
+        if dist_west == min_dist:
+            target_heading = 0.0
+        elif dist_east == min_dist:
+            target_heading = math.pi
+        elif dist_south == min_dist:
+            target_heading = math.pi / 2.0
+        else:
+            target_heading = -math.pi / 2.0
+
+        heading_error = normalize_angle(target_heading - self.estimator.theta)
+        omega = clamp(K_ANGLE * heading_error, -MAX_ANGULAR_SPEED, MAX_ANGULAR_SPEED)
+        return v, omega
+
+    def _is_stopped(self) -> bool:
+        return abs(self.estimator.v) <= STOP_SPEED and abs(self.estimator.omega) <= 0.15
+
     def _sensors_ready(self) -> bool:
         return (self.estimator.has_joint and self.estimator.has_imu
                 and self._has_image and self.mapper.has_info)
@@ -1367,11 +1173,6 @@ class SolutionNode(Node):
                         self.get_logger().info(
                             f"[DYNAMIC] Dynamic waypoint detected: id={wid} ({wp['x']:.3f},{wp['y']:.3f})")
 
-            if self.mission.state in (MissionManager.NAVIGATE, MissionManager.DWELL,
-                                      MissionManager.RETURN_HOME, MissionManager.HOME_DWELL,
-                                      MissionManager.PLAN, MissionManager.REPLAN):
-                self.mission.request_replan()
-
         # 2. Magenta Obstacle Wall Detection
         try:
             obs_px = self.obs_detector.detect(self._latest_bgr)
@@ -1386,13 +1187,12 @@ class SolutionNode(Node):
                 self.grid.rebuild(stable)
                 self._map_built_with_obstacles = True
                 self.get_logger().info(f"[PERCEPTION] Detected {len(stable)} obstacles; rebuilt grid.")
-                if self.mission.current_path and not self.grid.path_free(self.mission.current_path):
-                    self.get_logger().warn("[PLANNER] Active path blocked by map rebuild — replanning.")
-                    self.mission.current_path = []
-                    self.follower.clear()
-                    self.mission.request_replan()
-                    if self.mission.state == MissionManager.NAVIGATE:
-                        self.mission.state = MissionManager.REPLAN
+                if self._current_path and not self.grid.path_free(self._current_path):
+                    self.get_logger().warn("[PLANNER] Active path blocked by map update — replanning.")
+                    self._current_path = []
+                    self.path_tracker.clear()
+                    if self._state == self.NAVIGATE:
+                        self._state = self.PLAN_ROUTE
 
         if self.debug_viz and self.debug_pub is not None:
             self._publish_debug_image(detections)
@@ -1404,20 +1204,20 @@ class SolutionNode(Node):
         for d in green_detections:
             cv2.circle(dbg, (int(d["u"]), int(d["v"])), int(d["radius_px"]), (255, 0, 0), 2)
             cv2.circle(dbg, (int(d["u"]), int(d["v"])), 3, (0, 0, 255), -1)
-        if self.mission.current_target is not None:
-            wp = self.tracker.get(self.mission.current_target)
+        if self._current_target is not None:
+            wp = self.tracker.get(self._current_target)
             if wp is not None:
                 u, v = self.mapper.world_to_pixel(wp["x"], wp["y"])
                 cv2.circle(dbg, (int(u), int(v)), 8, (0, 255, 255), 2)
-        for i in range(len(self.mission.current_path) - 1):
-            u0, v0 = self.mapper.world_to_pixel(*self.mission.current_path[i])
-            u1, v1 = self.mapper.world_to_pixel(*self.mission.current_path[i + 1])
+        for i in range(len(self._current_path) - 1):
+            u0, v0 = self.mapper.world_to_pixel(*self._current_path[i])
+            u1, v1 = self.mapper.world_to_pixel(*self._current_path[i + 1])
             cv2.line(dbg, (int(u0), int(v0)), (int(u1), int(v1)), (0, 255, 0), 2)
         msg = self.bridge.cv2_to_imgmsg(dbg, encoding="bgr8")
         self.debug_pub.publish(msg)
 
-    # -- Planning Helpers --
-    def _do_full_plan(self, now_s: float) -> bool:
+    # -- Route Planning Helper --
+    def _plan_next_target(self) -> bool:
         unvisited = self.tracker.unvisited_confirmed()
         if not unvisited:
             return False
@@ -1429,6 +1229,7 @@ class SolutionNode(Node):
             return False
         if not order:
             return False
+        self._planned_count = self.tracker.confirmed_count()
         target_id = order[0]
         wp = self.tracker.get(target_id)
         if wp is None:
@@ -1437,40 +1238,25 @@ class SolutionNode(Node):
         if path is None:
             self.get_logger().warn(f"[PLANNER] No collision-free path to #{target_id} ({wp['x']:.2f},{wp['y']:.2f})")
             return False
-        self.mission.ordered_route = order
-        self.mission.current_target = target_id
-        self.mission.current_path = path
-        self.follower.set_path(path)
-        self.mission.notify_planned(self.tracker.confirmed_count())
-        self._plan_fail_count = 0
+        self._route = order
+        self._current_target = target_id
+        self._current_path = path
+        self.path_tracker.set_path(path)
         self.get_logger().info(
             f"[PLANNER] Path planned from ({start[0]:.2f},{start[1]:.2f}) to #{target_id} "
             f"({wp['x']:.2f},{wp['y']:.2f}) Length={path_length(path):.2f}m")
         return True
 
-    def _do_replan_keep_target(self) -> bool:
-        wp = self.tracker.get(self.mission.current_target)
-        if wp is None:
-            return self._do_full_plan(0.0)
-        start = (self.estimator.x, self.estimator.y)
-        path = plan_safe_path(self.grid, start, (wp["x"], wp["y"]))
-        if path is None:
-            return False
-        self.mission.current_path = path
-        self.follower.set_path(path)
-        self.mission.notify_planned(self.tracker.confirmed_count())
-        self._plan_fail_count = 0
-        return True
-
-    def _do_plan_home(self) -> bool:
+    def _plan_home(self) -> bool:
         start = (self.estimator.x, self.estimator.y)
         path = plan_safe_path(self.grid, start, (HOME_X, HOME_Y))
         if path is None:
             self.get_logger().warn("[PLANNER] No collision-free path home!")
             return False
-        self.mission.current_path = path
-        self.follower.set_path(path)
-        self._plan_fail_count = 0
+        self._current_target = None
+        self._current_path = path
+        self.path_tracker.set_path(path)
+        self.get_logger().info(f"[PLANNER] Collision-free path planned HOME. Length={path_length(path):.2f}m")
         return True
 
     # -- Main Control Loop --
@@ -1487,7 +1273,7 @@ class SolutionNode(Node):
             self.get_logger().info(
                 f"[ODOM] x={self.estimator.x:.3f} y={self.estimator.y:.3f} "
                 f"th={self.estimator.theta:.3f} v={self.estimator.v:.3f} "
-                f"state={self.mission.state} waypoints={self.tracker.confirmed_count()} "
+                f"state={self._state} targets={self.tracker.confirmed_count()} "
                 f"obstacles={len(self.obs_tracker.stable)}")
 
         if self._tick % VISION_EVERY_N_TICKS == 0:
@@ -1496,180 +1282,195 @@ class SolutionNode(Node):
             except Exception as exc:
                 self.get_logger().warn(f"Perception step failed: {exc}")
 
-        pose = (self.estimator.x, self.estimator.y, self.estimator.theta)
-        vel = (self.estimator.v, self.estimator.omega)
-
-        if self.mission.state in (MissionManager.INIT, MissionManager.LOCALIZE):
-            self.mission.step(pose, vel, self.tracker, now_s)
+        # ---------------- State Machine ----------------
+        if self._state == self.WAIT_FOR_SENSORS:
+            if self._sensors_ready():
+                self._state = self.PERCEIVE
+                self._perceive_time0 = now_s
+                self.get_logger().info("Sensors ready — scanning arena for targets and obstacles...")
             self._publish_stop()
             return
 
-        if self.mission.state == MissionManager.PERCEIVE:
+        if self._state == self.PERCEIVE:
             if not self._sensors_ready():
+                self._state = self.WAIT_FOR_SENSORS
                 self._publish_stop()
                 return
             n_obs = len(self.obs_tracker.stable)
+            n_wps = self.tracker.confirmed_count()
             waited = (now_s - self._perceive_time0) if self._perceive_time0 else 0.0
-            if self.tracker.confirmed_count() >= 1 and (n_obs >= 2 or waited > 8.0):
+            # Wait until initial 5 targets and 4 obstacles are confirmed, or timeout
+            if (n_wps >= 5 and n_obs >= 4) or (n_wps >= 5 and waited > 3.0) or waited > 6.0:
+                self.get_logger().info(f"[MISSION] Scanning complete: {n_wps} targets, {n_obs} obstacles confirmed.")
+                self._state = self.PLAN_ROUTE
+            self._publish_stop()
+            return
+
+        if self._state == self.PLAN_ROUTE:
+            if not self.tracker.has_unvisited():
+                dist_home = math.hypot(self.estimator.x - HOME_X, self.estimator.y - HOME_Y)
+                if dist_home <= HOME_TOLERANCE and self._is_stopped():
+                    if self._home_dwell_start is None:
+                        self._home_dwell_start = now_s
+                    self._state = self.HOME_DWELL
+                else:
+                    if self._plan_home():
+                        self._state = self.HOME
+                    else:
+                        self._publish_stop()
+                return
+
+            if self._plan_next_target():
+                self._dwell_start = None
+                self._state = self.NAVIGATE
+            else:
+                self._publish_stop()
+            return
+
+        if self._state == self.NAVIGATE:
+            if (self._current_target is None
+                    or self.tracker.get(self._current_target) is None
+                    or self.tracker.get(self._current_target)["visited"]):
+                self._dwell_start = None
+                self._current_path = []
+                self.path_tracker.clear()
+                self._state = self.PLAN_ROUTE
+                self._publish_stop()
+                return
+
+            # Check if active path is still collision-free
+            if not self._current_path or not self.grid.path_free(self._current_path):
+                self.get_logger().warn("[PLANNER] Path blocked — replanning.")
+                self._current_path = []
+                self.path_tracker.clear()
+                self._state = self.PLAN_ROUTE
+                self._publish_stop()
+                return
+
+            v, w, arrived = self.path_tracker.compute(
+                self.estimator.x, self.estimator.y, self.estimator.theta, self.grid
+            )
+
+            wp = self.tracker.get(self._current_target)
+            dist_to_target = math.hypot(self.estimator.x - wp["x"], self.estimator.y - wp["y"])
+
+            if (arrived or dist_to_target <= self.stop_radius) and self._is_stopped():
+                self._dwell_start = now_s
+                self._state = self.DWELL
+                self._publish_stop()
                 self.get_logger().info(
-                    f"[MISSION] PERCEIVE -> PLAN ({self.tracker.confirmed_count()} targets, {n_obs} obstacles)")
-                self.mission.step(pose, vel, self.tracker, now_s)
+                    f"[DWELL] Arrived at #{self._current_target} ({wp['x']:.2f},{wp['y']:.2f}) "
+                    f"dist={dist_to_target:.3f}m, starting dwell...")
+                return
+
+            v_safe, w_safe = self._perimeter_safe_cmd(v, w)
+            self.cmd_pub.publish(self._make_safe_cmd(v_safe, w_safe))
+            return
+
+        if self._state == self.DWELL:
             self._publish_stop()
-            return
-
-        if self.mission.state == MissionManager.PLAN:
-            prev = self.mission.state
-            self.mission.step(pose, vel, self.tracker, now_s)
-            if self.mission.state != prev:
-                self._publish_stop()
-                return
-            if self._do_full_plan(now_s):
-                self.mission.step(pose, vel, self.tracker, now_s)
-            else:
-                self._plan_fail_count += 1
-                if self._plan_fail_count > 10:
-                    self.mission.fail("planning failed")
-                self._publish_stop()
-            return
-
-        if self.mission.state == MissionManager.REPLAN:
-            prev_target = self.mission.current_target
-            self.mission.step(pose, vel, self.tracker, now_s)
-            if self.mission.state == MissionManager.RETURN_HOME:
-                self._publish_stop()
-                return
-            if self.mission.state == MissionManager.NAVIGATE:
-                return
-            ok = False
-            if (prev_target is not None and self.tracker.get(prev_target) is not None
-                    and not self.tracker.get(prev_target)["visited"]):
-                self.mission.current_target = prev_target
-                ok = self._do_replan_keep_target()
-                if not ok:
-                    self.mission.current_target = None
-                    ok = self._do_full_plan(now_s)
-            else:
-                self.mission.current_target = None
-                ok = self._do_full_plan(now_s)
-            if ok:
-                self.mission.step(pose, vel, self.tracker, now_s)
-            else:
-                self._plan_fail_count += 1
-                if self._plan_fail_count > 10:
-                    self.mission.fail("replanning failed")
-                self._publish_stop()
-            return
-
-        if self.mission.state == MissionManager.NAVIGATE:
-            prev_target = self.mission.current_target
-            self.mission.step(pose, vel, self.tracker, now_s)
-            if self.mission.state != MissionManager.NAVIGATE:
-                # Target reached / dwell started: snap odometry to target to zero out drift
-                if prev_target is not None and self.mission.state in (MissionManager.PLAN, MissionManager.REPLAN):
-                    wp = self.tracker.get(prev_target)
-                    if wp is not None:
-                        self.estimator.snap_to(wp["x"], wp["y"])
-                        self.get_logger().info(f"[ODOM-SNAP] Drift zeroed at target #{prev_target} ({wp['x']:.2f},{wp['y']:.2f})")
-                self._publish_stop()
+            wp = self.tracker.get(self._current_target) if self._current_target is not None else None
+            if wp is None:
+                self._state = self.PLAN_ROUTE
                 return
 
-            if not self.mission.current_path or not self.grid.path_free(self.mission.current_path):
-                self.get_logger().warn("[PLANNER] Path blocked -> REPLAN")
-                self.mission.current_path = []
-                self.follower.clear()
-                self.mission.request_replan()
-                self.mission.state = MissionManager.REPLAN
-                self._publish_stop()
+            dist_to_target = math.hypot(self.estimator.x - wp["x"], self.estimator.y - wp["y"])
+            if dist_to_target > WAYPOINT_TOLERANCE or not self._is_stopped():
+                self._dwell_start = None
+                self._state = self.NAVIGATE
                 return
 
-            v, w = self.follower.compute(self.estimator.x, self.estimator.y, self.estimator.theta, self.grid)
+            if self._dwell_start is None:
+                self._dwell_start = now_s
+                return
 
-            # Stuck detection & recovery
-            if v > self._stuck_threshold_v:
-                if self._stuck_pos_start is None:
-                    self._stuck_pos_start = (now_s, self.estimator.x, self.estimator.y)
+            elapsed = now_s - self._dwell_start
+            if elapsed >= self.dwell_time:
+                self.tracker.mark_visited(self._current_target)
+                self.get_logger().info(
+                    f"[WP] Target #{self._current_target} collected "
+                    f"({wp['x']:.2f},{wp['y']:.2f}) dwell={elapsed:.2f}s")
+                self._dwell_start = None
+                self._current_target = None
+                self._current_path = []
+                self.path_tracker.clear()
+                if self.tracker.has_unvisited():
+                    self._state = self.PLAN_ROUTE
                 else:
-                    t0, x0, y0 = self._stuck_pos_start
-                    dist_moved = math.hypot(self.estimator.x - x0, self.estimator.y - y0)
-                    if now_s - t0 > self._stuck_time and dist_moved < self._stuck_min_progress:
-                        self.get_logger().warn("[STUCK] Robot stuck; rotating in place.")
-                        v, w = 0.0, 1.0
-                        self._stuck_pos_start = None
-            else:
-                self._stuck_pos_start = None
-
-            # Perimeter safety override
-            px_min, px_max, py_min, py_max = self._peri_bounds
-            dist_w = self.estimator.x - px_min
-            dist_e = px_max - self.estimator.x
-            dist_s = self.estimator.y - py_min
-            dist_n = py_max - self.estimator.y
-            d_min = min(dist_w, dist_e, dist_s, dist_n)
-            if d_min < 0.18 and v > 0.05:
-                v = 0.05
-                if dist_w == d_min:
-                    target_heading = 0.0
-                elif dist_e == d_min:
-                    target_heading = math.pi
-                elif dist_s == d_min:
-                    target_heading = math.pi / 2.0
-                else:
-                    target_heading = -math.pi / 2.0
-                he_peri = normalize_angle(target_heading - self.estimator.theta)
-                w = clamp(2.0 * he_peri, -MAX_ANGULAR_SPEED, MAX_ANGULAR_SPEED)
-
-            self.cmd_pub.publish(self._make_safe_cmd(v, w))
+                    self.get_logger().info("All targets collected! Returning home.")
+                    if self._plan_home():
+                        self._state = self.HOME
+                    else:
+                        self._state = self.PLAN_ROUTE
             return
 
-        if self.mission.state == MissionManager.DWELL:
-            self._publish_stop()
-            self.mission.step(pose, vel, self.tracker, now_s)
-            if self.mission.state in (MissionManager.PLAN, MissionManager.REPLAN, MissionManager.RETURN_HOME):
-                self.get_logger().info("[DWELL] Waypoint collected.")
-            return
-
-        if self.mission.state == MissionManager.RETURN_HOME:
-            self.mission.step(pose, vel, self.tracker, now_s)
-            if self.mission.state != MissionManager.RETURN_HOME:
+        if self._state == self.HOME:
+            # Check if dynamic targets appeared while returning home
+            if self.tracker.has_unvisited():
+                self.get_logger().info(
+                    f"Dynamic targets detected ({self.tracker.confirmed_count()} total) — "
+                    "cancelling home return to collect dynamic targets.")
+                self._home_dwell_start = None
+                self._current_path = []
+                self.path_tracker.clear()
+                self._state = self.PLAN_ROUTE
                 self._publish_stop()
                 return
-            if not self.mission.current_path or not self.grid.path_free(self.mission.current_path):
-                if not self._do_plan_home():
-                    self._plan_fail_count += 1
-                    if self._plan_fail_count > 10:
-                        self.mission.fail("no path home")
+
+            dist_home = math.hypot(self.estimator.x - HOME_X, self.estimator.y - HOME_Y)
+            if dist_home <= HOME_TOLERANCE and self._is_stopped():
+                if self._home_dwell_start is None:
+                    self._home_dwell_start = now_s
+                    self.get_logger().info("[HOME] Entered start zone at (0,0), dwell started...")
+                self._state = self.HOME_DWELL
+                self._publish_stop()
+                return
+
+            if not self._current_path or not self.grid.path_free(self._current_path):
+                if not self._plan_home():
                     self._publish_stop()
                     return
-                self.get_logger().info("[MISSION] Collision-free path planned home.")
 
-            v, w = self.follower.compute(self.estimator.x, self.estimator.y, self.estimator.theta, self.grid)
-            d_home = math.hypot(self.estimator.x - HOME_X, self.estimator.y - HOME_Y)
-            if d_home <= self.mission.target_stop_radius:
-                v, w = 0.0, 0.0
-            self.cmd_pub.publish(self._make_safe_cmd(v, w))
+            v, w, arrived = self.path_tracker.compute(
+                self.estimator.x, self.estimator.y, self.estimator.theta, self.grid
+            )
+
+            if (arrived or dist_home <= self.stop_radius) and self._is_stopped():
+                if self._home_dwell_start is None:
+                    self._home_dwell_start = now_s
+                    self.get_logger().info("[HOME] Entered start zone at (0,0), dwell started...")
+                self._state = self.HOME_DWELL
+                self._publish_stop()
+                return
+
+            v_safe, w_safe = self._perimeter_safe_cmd(v, w)
+            self.cmd_pub.publish(self._make_safe_cmd(v_safe, w_safe))
             return
 
-        if self.mission.state == MissionManager.HOME_DWELL:
+        if self._state == self.HOME_DWELL:
             self._publish_stop()
-            self.mission.step(pose, vel, self.tracker, now_s)
-            if self.mission.state == MissionManager.COMPLETE:
-                self.get_logger().info("[MISSION] COMPLETE — All waypoints collected and home dwell complete.")
+            dist_home = math.hypot(self.estimator.x - HOME_X, self.estimator.y - HOME_Y)
+            if dist_home > HOME_TOLERANCE or not self._is_stopped():
+                self._home_dwell_start = None
+                self._state = self.HOME
+                return
+
+            if self._home_dwell_start is None:
+                self._home_dwell_start = now_s
+                return
+
+            elapsed = now_s - self._home_dwell_start
+            if elapsed >= self.dwell_time:
+                self.get_logger().info(
+                    f"[HOME] Home dwell complete ({elapsed:.2f}s)! MISSION ACCOMPLISHED.")
+                self._state = self.COMPLETE
             return
 
-        if self.mission.state == MissionManager.COMPLETE:
+        if self._state == self.COMPLETE:
             self._publish_stop()
             return
 
-        if self.mission.state == MissionManager.FAILSAFE:
-            self._publish_stop()
-            if self._tick % 40 == 0:
-                self.get_logger().warn(f"[MISSION] FAILSAFE ({self.mission.fail_reason}) — holding stop, retrying.")
-                self._plan_fail_count = 0
-                if self._sensors_ready():
-                    self.mission.recover()
-            return
-
-        self.get_logger().warn(f"Unknown state {self.mission.state}; stopping.")
+        self.get_logger().warn(f"Unknown state {self._state}; stopping.")
         self._publish_stop()
 
 
