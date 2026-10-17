@@ -1,0 +1,165 @@
+<?xml version="1.0"?>
+<sdf version="1.9">
+  <world name="arena">
+    <physics name="1ms" type="dart">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+    <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
+    <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>
+    <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
+    <plugin filename="gz-sim-sensors-system" name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+    <plugin filename="gz-sim-imu-system" name="gz::sim::systems::Imu"/>
+
+    <light type="directional" name="sun">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 5 0 0 0</pose>
+      <diffuse>0.9 0.9 0.9 1</diffuse>
+      <specular>0.2 0.2 0.2 1</specular>
+      <direction>-0.4 0.2 -0.9</direction>
+    </light>
+
+    <!-- Arena: 3.0 x 3.0 m, origin at centre, +X right, +Y up. -->
+    <model name="arena">
+      <static>true</static>
+      <link name="floor">
+        <collision name="floor_col">
+          <pose>1.375 1.375 -0.05 0 0 0</pose>
+          <geometry><box><size>3.04 3.04 0.1</size></box></geometry>
+          <surface><friction><ode><mu>0.8</mu><mu2>0.8</mu2></ode></friction></surface>
+        </collision>
+        <visual name="floor_vis">
+          <pose>1.375 1.375 -0.05 0 0 0</pose>
+          <geometry><box><size>3.04 3.04 0.1</size></box></geometry>
+          <material><ambient>0.8 0.8 0.8 1</ambient><diffuse>0.8 0.8 0.8 1</diffuse></material>
+        </visual>
+        <visual name="x_axis">
+          <pose>1.375 0 0.0005 0 0 0</pose>
+          <geometry><box><size>3.00 0.01 0.001</size></box></geometry>
+          <material><ambient>1 0 0 1</ambient><diffuse>1 0 0 1</diffuse></material>
+        </visual>
+        <visual name="y_axis">
+          <pose>0 1.375 0.0005 0 0 0</pose>
+          <geometry><box><size>0.01 3.00 0.001</size></box></geometry>
+          <material><ambient>0 0.7 0 1</ambient><diffuse>0 0.7 0 1</diffuse></material>
+        </visual>
+        <visual name="start_zone">
+          <pose>0 0 0.0006 0 0 0</pose>
+          <geometry><box><size>0.30 0.30 0.001</size></box></geometry>
+          <material>
+            <ambient>0.9 0.1 0.1 1</ambient>
+            <diffuse>0.9 0.1 0.1 1</diffuse>
+          </material>
+        </visual>
+      </link>
+
+      <link name="wall_n">
+        <pose>1.375 2.885 0.05 0 0 0</pose>
+        <collision name="c"><geometry><box><size>3.04 0.02 0.1</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>3.04 0.02 0.1</size></box></geometry>
+          <material><ambient>0.3 0.3 0.3 1</ambient><diffuse>0.3 0.3 0.3 1</diffuse></material></visual>
+      </link>
+      <link name="wall_s">
+        <pose>1.375 -0.135 0.05 0 0 0</pose>
+        <collision name="c"><geometry><box><size>3.04 0.02 0.1</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>3.04 0.02 0.1</size></box></geometry>
+          <material><ambient>0.3 0.3 0.3 1</ambient><diffuse>0.3 0.3 0.3 1</diffuse></material></visual>
+      </link>
+      <link name="wall_e">
+        <pose>2.885 1.375 0.05 0 0 0</pose>
+        <collision name="c"><geometry><box><size>0.02 3.00 0.1</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.02 3.00 0.1</size></box></geometry>
+          <material><ambient>0.3 0.3 0.3 1</ambient><diffuse>0.3 0.3 0.3 1</diffuse></material></visual>
+      </link>
+      <link name="wall_w">
+        <pose>-0.135 1.375 0.05 0 0 0</pose>
+        <collision name="c"><geometry><box><size>0.02 3.00 0.1</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.02 3.00 0.1</size></box></geometry>
+          <material><ambient>0.3 0.3 0.3 1</ambient><diffuse>0.3 0.3 0.3 1</diffuse></material></visual>
+      </link>
+    </model>
+
+    <!-- ================================================================
+         Overhead Camera
+         Position: centre of 3×3 m arena at height 4 m.
+         FOV 70° (1.2217 rad) gives ground coverage ≈ 5.6 m — full arena.
+         Link pitched 90° so camera +Z (optical axis) points world -Z (down).
+         Topics (via bridge.yaml):
+           /overhead_camera/image_raw   → sensor_msgs/Image
+           /overhead_camera/camera_info → sensor_msgs/CameraInfo
+         ================================================================ -->
+    <model name="overhead_camera">
+      <static>true</static>
+      <pose>1.5 1.5 4.0 0 1.5707963 0</pose>
+      <link name="cam_link">
+        <visual name="cam_body">
+          <geometry><box><size>0.05 0.05 0.03</size></box></geometry>
+          <material><ambient>0.1 0.1 0.1 1</ambient><diffuse>0.1 0.1 0.1 1</diffuse></material>
+        </visual>
+        <sensor name="overhead_cam" type="camera">
+          <always_on>true</always_on>
+          <update_rate>30</update_rate>
+          <topic>/overhead_camera/image_raw</topic>
+          <camera>
+            <horizontal_fov>1.2217</horizontal_fov>
+            <image>
+              <width>800</width>
+              <height>800</height>
+              <format>R8G8B8</format>
+            </image>
+            <clip><near>0.1</near><far>6.0</far></clip>
+          </camera>
+        </sensor>
+      </link>
+    </model>
+
+    <!-- ================================================================
+         Obstacle Walls (Tier 3 Arena Obstacles)
+         Magenta tops for overhead-camera detection.
+         Dimensions: 0.50 m long, 0.06 m wide, 0.20 m tall.
+         ================================================================ -->
+    <model name="obs0"><static>true</static><pose>1.1 1.9 0.10 0 0 0.785</pose>
+      <link name="l">
+        <collision name="c"><geometry><box><size>0.50 0.06 0.20</size></box></geometry></collision>
+        <visual name="body"><geometry><box><size>0.50 0.06 0.18</size></box></geometry>
+          <pose>0 0 -0.01 0 0 0</pose>
+          <material><ambient>0.25 0.25 0.25 1</ambient><diffuse>0.25 0.25 0.25 1</diffuse></material></visual>
+        <visual name="top"><geometry><box><size>0.50 0.06 0.02</size></box></geometry>
+          <pose>0 0 0.09 0 0 0</pose>
+          <material><ambient>0.9 0.0 0.9 1</ambient><diffuse>0.9 0.0 0.9 1</diffuse></material></visual>
+      </link></model>
+    <model name="obs1"><static>true</static><pose>2.0 1.1 0.10 0 0 0.0</pose>
+      <link name="l">
+        <collision name="c"><geometry><box><size>0.50 0.06 0.20</size></box></geometry></collision>
+        <visual name="body"><geometry><box><size>0.50 0.06 0.18</size></box></geometry>
+          <pose>0 0 -0.01 0 0 0</pose>
+          <material><ambient>0.25 0.25 0.25 1</ambient><diffuse>0.25 0.25 0.25 1</diffuse></material></visual>
+        <visual name="top"><geometry><box><size>0.50 0.06 0.02</size></box></geometry>
+          <pose>0 0 0.09 0 0 0</pose>
+          <material><ambient>0.9 0.0 0.9 1</ambient><diffuse>0.9 0.0 0.9 1</diffuse></material></visual>
+      </link></model>
+    <model name="obs2"><static>true</static><pose>0.9 1.3 0.10 0 0 1.5708</pose>
+      <link name="l">
+        <collision name="c"><geometry><box><size>0.50 0.06 0.20</size></box></geometry></collision>
+        <visual name="body"><geometry><box><size>0.50 0.06 0.18</size></box></geometry>
+          <pose>0 0 -0.01 0 0 0</pose>
+          <material><ambient>0.25 0.25 0.25 1</ambient><diffuse>0.25 0.25 0.25 1</diffuse></material></visual>
+        <visual name="top"><geometry><box><size>0.50 0.06 0.02</size></box></geometry>
+          <pose>0 0 0.09 0 0 0</pose>
+          <material><ambient>0.9 0.0 0.9 1</ambient><diffuse>0.9 0.0 0.9 1</diffuse></material></visual>
+      </link></model>
+    <model name="obs3"><static>true</static><pose>1.8 2.2 0.10 0 0 0.524</pose>
+      <link name="l">
+        <collision name="c"><geometry><box><size>0.50 0.06 0.20</size></box></geometry></collision>
+        <visual name="body"><geometry><box><size>0.50 0.06 0.18</size></box></geometry>
+          <pose>0 0 -0.01 0 0 0</pose>
+          <material><ambient>0.25 0.25 0.25 1</ambient><diffuse>0.25 0.25 0.25 1</diffuse></material></visual>
+        <visual name="top"><geometry><box><size>0.50 0.06 0.02</size></box></geometry>
+          <pose>0 0 0.09 0 0 0</pose>
+          <material><ambient>0.9 0.0 0.9 1</ambient><diffuse>0.9 0.0 0.9 1</diffuse></material></visual>
+      </link></model>
+
+  </world>
+</sdf>
